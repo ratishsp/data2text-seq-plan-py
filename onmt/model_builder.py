@@ -20,7 +20,7 @@ from onmt.utils.logging import logger
 from onmt.utils.parse import ArgumentParser
 
 
-def build_embeddings(opt, text_field, for_encoder=True):
+def build_embeddings(opt, text_field, for_encoder=True, for_tgt_length=False):
     """
     Args:
         opt: the option in current environment.
@@ -28,6 +28,8 @@ def build_embeddings(opt, text_field, for_encoder=True):
         for_encoder(bool): build Embeddings for encoder or decoder?
     """
     emb_dim = opt.src_word_vec_size if for_encoder else opt.tgt_word_vec_size
+    if for_tgt_length:
+        emb_dim = opt.rnn_size
 
     if opt.model_type == "vec" and for_encoder:
         return VecEmbedding(
@@ -64,7 +66,9 @@ def build_embeddings(opt, text_field, for_encoder=True):
     return emb
 
 
-def build_encoder(opt, embeddings):
+def build_encoder(opt, embeddings, src_summary_ctx_emb=None, tgt_lengths_emb=None, tgt_lengths_vocab=None,
+                  block_ngram_plan_repeat=None, block_repetitions=None, current_paragraph_index=None, min_paragraph_count=None,
+                  block_consecutive_repetitions=None, src_vocab=None):
     """
     Various encoder dispatcher function.
     Args:
@@ -73,7 +77,9 @@ def build_encoder(opt, embeddings):
     """
     enc_type = opt.encoder_type if opt.model_type == "text" \
         or opt.model_type == "vec" else opt.model_type
-    return str2enc[enc_type].from_opt(opt, embeddings)
+    return str2enc[enc_type].from_opt(opt, embeddings, src_summary_ctx_emb, tgt_lengths_emb, tgt_lengths_vocab,
+                                      block_ngram_plan_repeat, block_repetitions, current_paragraph_index, min_paragraph_count,
+                                      block_consecutive_repetitions, src_vocab)
 
 
 def build_decoder(opt, embeddings):
@@ -106,7 +112,9 @@ def load_test_model(opt, model_path=None):
         fields = vocab
 
     model = build_base_model(model_opt, fields, use_gpu(opt), checkpoint,
-                             opt.gpu)
+                             opt.gpu, opt.block_ngram_plan_repeat, opt.block_repetitions,
+                             opt.current_paragraph_index, opt.min_paragraph_count,
+                             opt.block_consecutive_repetitions)
     if opt.fp32:
         model.float()
     model.eval()
@@ -114,7 +122,9 @@ def load_test_model(opt, model_path=None):
     return fields, model, model_opt
 
 
-def build_base_model(model_opt, fields, gpu, checkpoint=None, gpu_id=None):
+def build_base_model(model_opt, fields, gpu, checkpoint=None, gpu_id=None, block_ngram_plan_repeat=None,
+                     block_repetitions=None, current_paragraph_index=None, min_paragraph_count=None,
+                     block_consecutive_repetitions=None):
     """Build a model from opts.
 
     Args:
@@ -142,12 +152,18 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, gpu_id=None):
     if model_opt.model_type == "text" or model_opt.model_type == "vec":
         src_field = fields["src"]
         src_emb = build_embeddings(model_opt, src_field)
+        src_summary_ctx_field = fields["src_summary_ctx"]
+        src_summary_ctx_emb = build_embeddings(model_opt, src_summary_ctx_field)
     else:
         src_emb = None
+        src_summary_ctx_emb = None
 
+    tgt_lengths_emb = build_embeddings(model_opt, fields["tgt_lengths"], for_tgt_length=True)
     # Build encoder.
-    encoder = build_encoder(model_opt, src_emb)
-
+    encoder = build_encoder(model_opt, src_emb, src_summary_ctx_emb, tgt_lengths_emb,
+                            fields["tgt_lengths"].base_field.vocab, block_ngram_plan_repeat, block_repetitions,
+                            current_paragraph_index, min_paragraph_count, block_consecutive_repetitions,
+                            fields["src"].base_field.vocab)
     # Build decoder.
     tgt_field = fields["tgt"]
     tgt_emb = build_embeddings(model_opt, tgt_field, for_encoder=False)

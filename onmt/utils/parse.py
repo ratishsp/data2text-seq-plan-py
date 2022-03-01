@@ -41,7 +41,7 @@ class ArgumentParser(cfargparse.ArgumentParser):
             model_opt.enc_rnn_size = model_opt.rnn_size
             model_opt.dec_rnn_size = model_opt.rnn_size
 
-        model_opt.brnn = model_opt.encoder_type == "brnn"
+        model_opt.brnn = model_opt.encoder_type in ["brnn", "classifier"]
 
         if model_opt.copy_attn_type is None:
             model_opt.copy_attn_type = model_opt.global_attention

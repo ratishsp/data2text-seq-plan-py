@@ -69,7 +69,7 @@ def model_opts(parser):
               help='Data type of the model.')
 
     group.add('--encoder_type', '-encoder_type', type=str, default='rnn',
-              choices=['rnn', 'brnn', 'mean', 'transformer', 'cnn'],
+              choices=['rnn', 'brnn', 'mean', 'transformer', 'cnn', 'classifier'],
               help="Type of encoder layer to use. Non-RNN layers "
                    "are experimental. Options are "
                    "[rnn|brnn|mean|transformer|cnn].")
@@ -199,12 +199,16 @@ def preprocess_opts(parser):
               help="Path(s) to the training source data")
     group.add('--train_tgt', '-train_tgt', required=True, nargs='+',
               help="Path(s) to the training target data")
+    group.add('--train_tgt_chosen_pp', '-train_tgt_chosen_pp', required=True, nargs='+',
+              help="Path(s) to the training source chosen pp")
     group.add('--train_ids', '-train_ids', nargs='+', default=[None],
               help="ids to name training shards, used for corpus weighting")
     group.add('--valid_src', '-valid_src',
               help="Path to the validation source data")
     group.add('--valid_tgt', '-valid_tgt',
               help="Path to the validation target data")
+    group.add('--valid_tgt_chosen_pp', '-valid_tgt_chosen_pp',
+              help="Path(s) to the validation target chosen pp")
 
     group.add('--src_dir', '-src_dir', default="",
               help="Source directory for image or audio files.")
@@ -352,7 +356,7 @@ def train_opts(parser):
               help="IP of master for torch.distributed training.")
     group.add('--master_port', '-master_port', default=10000, type=int,
               help="Port of master for torch.distributed training.")
-    group.add('--queue_size', '-queue_size', default=400, type=int,
+    group.add('--queue_size', '-queue_size', default=40, type=int,
               help="Size of queue for each process in producer/consumer")
 
     group.add('--seed', '-seed', type=int, default=-1,
@@ -480,6 +484,13 @@ def train_opts(parser):
                    'suggested a value of 0.98 for beta2, this parameter may '
                    'not work well for normal models / default '
                    'baselines.')
+    group.add('--label_smoothing_pp_selection', '-label_smoothing_pp_selection', type=float, default=0.0,
+              help="Label smoothing value epsilon for pp selection. "
+                   "Probabilities of all non-true labels "
+                   "will be smoothed by epsilon / (vocab_size - 1). "
+                   "Set to zero to turn off label smoothing. "
+                   "For more detailed information, see: "
+                   "https://arxiv.org/abs/1512.00567")
     group.add('--label_smoothing', '-label_smoothing', type=float, default=0.0,
               help="Label smoothing value epsilon. "
                    "Probabilities of all non-true labels "
@@ -498,6 +509,16 @@ def train_opts(parser):
               help="Step for moving average. "
                    "Default is every update, "
                    "if -average_decay is set.")
+    group.add('--gumbel_softmax_temp', '-gumbel_softmax_temp', type=float, default=0.5,
+              help="Temperature for gumbel softmax")
+    group.add('--max_training_steps', '-max_training_steps', type=int, default=30000,
+              help="Maximum training steps used for computation of scheduled sampling")
+    group.add('--min_teacher_forcing_ratio', '-min_teacher_forcing_ratio', type=float, default=0,
+              help="Minimum teacher forcing ratio")
+    group.add('--pp_prediction_loss_multiplier', '-pp_prediction_loss_multiplier', type=float, default=1.0,
+              help="Multiplier for pp prediction loss")
+    group.add('--kl_loss_multiplier', '-kl_loss_multiplier', type=float, default=1.0,
+              help="Multiplier for kl div loss")
 
     # learning rate
     group = parser.add_argument_group('Optimization- Rate')
@@ -658,6 +679,9 @@ def translate_opts(parser):
                    "(higher = longer generation)")
     group.add('--beta', '-beta', type=float, default=-0.,
               help="Coverage penalty parameter")
+    group.add('--block_ngram_plan_repeat', '-block_ngram_plan_repeat',
+              type=int, default=0,
+              help='Block repetition of ngrams in plan during decoding.')
     group.add('--block_ngram_repeat', '-block_ngram_repeat',
               type=int, default=0,
               help='Block repetition of ngrams during decoding.')
@@ -665,6 +689,9 @@ def translate_opts(parser):
               nargs='+', type=str, default=[],
               help="Ignore these strings when blocking repeats. "
                    "You want to block sentence delimiters.")
+    group.add('--block_repetitions', '-block_repetitions',
+              type=int, default=0,
+              help='Block repetition of ngrams during decoding.')
     group.add('--replace_unk', '-replace_unk', action="store_true",
               help="Replace the generated UNK tokens with the "
                    "source token that had highest attention weight. If "
@@ -722,6 +749,18 @@ def translate_opts(parser):
               type=int, default=3, choices=[3, 1],
               help="Using grayscale image can training "
                    "model faster and smaller")
+    group.add('--pp_output', '-pp_output', type=str, default=None,
+              help="File to write pp output")
+    group.add('--pp_input', '-pp_input', type=str, default=None,
+              help="File to read pp input from ")
+
+    # Options for controlling the count of paragraphs in the output
+    group.add('--current_paragraph_index', '-current_paragraph_index', type=int, default=-1,
+              help='Index of the current paragraph')
+    group.add('--min_paragraph_count', '-min_paragraph_count', type=int, default=10,
+              help='Minimum number of paragraphs in the output')
+    group.add('--block_consecutive_repetitions', '-block_consecutive_repetitions', type=int, default=-1,
+              help='Block consecutive repetition of a unigram')
 
 
 # Copyright 2016 The Chromium Authors. All rights reserved.

@@ -15,6 +15,8 @@ import traceback
 
 import onmt.utils
 from onmt.utils.logging import logger
+from torch.nn.utils.rnn import pad_sequence
+from onmt.utils.statistics import StatisticsTypes
 
 
 def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
@@ -33,6 +35,7 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
     """
 
     tgt_field = dict(fields)["tgt"].base_field
+    src_field = dict(fields)["src"].base_field
     train_loss = onmt.utils.loss.build_loss_compute(model, tgt_field, opt)
     valid_loss = onmt.utils.loss.build_loss_compute(
         model, tgt_field, opt, train=False)
@@ -58,7 +61,7 @@ def build_trainer(opt, device_id, model, fields, optim, model_saver=None):
         opt.early_stopping, scorers=onmt.utils.scorers_from_opts(opt)) \
         if opt.early_stopping > 0 else None
 
-    report_manager = onmt.utils.build_report_manager(opt)
+    report_manager = onmt.utils.build_report_manager(opt, gpu_rank)
     trainer = onmt.Trainer(model, train_loss, valid_loss, optim, trunc_size,
                            shard_size, norm_method,
                            accum_count, accum_steps,
@@ -107,7 +110,8 @@ class Trainer(object):
                  n_gpu=1, gpu_rank=1,
                  gpu_verbose_level=0, report_manager=None, model_saver=None,
                  average_decay=0, average_every=1, model_dtype='fp32',
-                 earlystopper=None, dropout=[0.3], dropout_steps=[0]):
+                 earlystopper=None, dropout=[0.3], dropout_steps=[0]
+                 ):
         # Basic attributes.
         self.model = model
         self.train_loss = train_loss
@@ -166,7 +170,7 @@ class Trainer(object):
                     self.train_loss.padding_idx).sum()
                 normalization += num_tokens.item()
             else:
-                normalization += batch.batch_size
+                normalization += batch.summary_context_count.sum()
             if len(batches) == self.accum_count:
                 yield batches, normalization
                 self.accum_count = self._accum_count(self.optim.training_step)
@@ -217,7 +221,10 @@ class Trainer(object):
                         valid_steps)
 
         total_stats = onmt.utils.Statistics()
-        report_stats = onmt.utils.Statistics()
+        report_stats = [onmt.utils.Statistics(name=StatisticsTypes.SUMMARY.name),
+                        onmt.utils.Statistics(name=StatisticsTypes.POSTERIOR_PP_SELECTION.name),
+                        onmt.utils.Statistics(name=StatisticsTypes.PRIOR_PP_SELECTION.name),
+                        onmt.utils.Statistics(name=StatisticsTypes.KL_PRIOR_POSTERIOR.name)]
         self._start_report_manager(start_time=total_stats.start_time)
 
         for i, (batches, normalization) in enumerate(
@@ -267,7 +274,7 @@ class Trainer(object):
                                   step, valid_stats=valid_stats)
                 # Run patience mechanism
                 if self.earlystopper is not None:
-                    self.earlystopper(valid_stats, step)
+                    self.earlystopper(valid_stats[0], step)
                     # If the patience has reached the limit, stop training
                     if self.earlystopper.has_stopped():
                         break
@@ -302,21 +309,32 @@ class Trainer(object):
         valid_model.eval()
 
         with torch.no_grad():
-            stats = onmt.utils.Statistics()
+            stats = [onmt.utils.Statistics(name=StatisticsTypes.SUMMARY.name),
+                     onmt.utils.Statistics(name=StatisticsTypes.POSTERIOR_PP_SELECTION.name),
+                     onmt.utils.Statistics(name=StatisticsTypes.PRIOR_PP_SELECTION.name),
+                     onmt.utils.Statistics(name=StatisticsTypes.KL_PRIOR_POSTERIOR.name)]
 
             for batch in valid_iter:
                 src, src_lengths = batch.src if isinstance(batch.src, tuple) \
                                    else (batch.src, None)
                 tgt = batch.tgt
-
+                summary_context_lengths = batch.summary_context_lengths.transpose(0, 1).contiguous().view(-1)
+                pp_lengths = batch.pp_lengths.transpose(0, 1).contiguous().view(-1)
                 # F-prop through the model.
-                outputs, attns = valid_model(src, tgt, src_lengths)
-
+                outputs, attns, prior_attentions, posterior_attentions, pp_context_mask, chosen_sentences_id_with_batch_indices = valid_model(src, pp_lengths,
+                                                                                                      batch.pp_count.squeeze(
+                                                                                                          0),
+                                                                                                      batch.src_summary_ctx,
+                                                                                                      summary_context_lengths,
+                                                                                                      batch.summary_context_count.squeeze(
+                                                                                                          0), tgt, batch.tgt_lengths.transpose(0, 1).contiguous())
                 # Compute loss.
-                _, batch_stats = self.valid_loss(batch, outputs, attns)
-
+                _, batch_stats = self.valid_loss(batch, outputs, attns, prior_attentions=prior_attentions,
+                                                 posterior_attentions=posterior_attentions, pp_mask=pp_context_mask,
+                                                 chosen_sentences_id_with_batch_indices=chosen_sentences_id_with_batch_indices)
                 # Update statistics.
-                stats.update(batch_stats)
+                for x in range(len(batch_stats)):
+                    stats[x].update(batch_stats[x])
 
         if moving_average:
             del valid_model
@@ -342,8 +360,7 @@ class Trainer(object):
             src, src_lengths = batch.src if isinstance(batch.src, tuple) \
                 else (batch.src, None)
             if src_lengths is not None:
-                report_stats.n_src_words += src_lengths.sum().item()
-
+                report_stats[0].n_src_words += src_lengths.sum().item()
             tgt_outer = batch.tgt
 
             bptt = False
@@ -354,25 +371,44 @@ class Trainer(object):
                 # 2. F-prop all but generator.
                 if self.accum_count == 1:
                     self.optim.zero_grad()
-                outputs, attns = self.model(src, tgt, src_lengths, bptt=bptt)
+                summary_context_lengths = batch.summary_context_lengths.transpose(0, 1).contiguous().view(-1)
+                pp_lengths = batch.pp_lengths.transpose(0, 1).contiguous().view(-1)
+                outputs, attns, prior_attentions, posterior_attentions, pp_context_mask, chosen_sentences_id_with_batch_indices = self.model(batch.src[0],
+                                                                                                     pp_lengths,
+                                                                                                     batch.pp_count.squeeze(
+                                                                                                         0),
+                                                                                                     batch.src_summary_ctx,
+                                                                                                     summary_context_lengths,
+                                                                                                     batch.summary_context_count.squeeze(
+                                                                                                         0), tgt,
+                                                                                                     batch.tgt_lengths.transpose(0, 1).contiguous(),
+                                                                                                     bptt=bptt,
+                                                                                                     tgt_chosen_pp=batch.tgt_chosen_pp,
+                                                                                                     training_step = self.optim.training_step)
                 bptt = True
 
                 # 3. Compute loss.
                 try:
-                    loss, batch_stats = self.train_loss(
+                    loss, loss_stats = self.train_loss(
                         batch,
                         outputs,
                         attns,
                         normalization=normalization,
                         shard_size=self.shard_size,
                         trunc_start=j,
-                        trunc_size=trunc_size)
+                        trunc_size=trunc_size,
+                        prior_attentions=prior_attentions,
+                        posterior_attentions=posterior_attentions,
+                        pp_mask = pp_context_mask,
+                        training_step = self.optim.training_step,
+                        chosen_sentences_id_with_batch_indices = chosen_sentences_id_with_batch_indices)
 
                     if loss is not None:
                         self.optim.backward(loss)
 
-                    total_stats.update(batch_stats)
-                    report_stats.update(batch_stats)
+                    total_stats.update(loss_stats[0])
+                    for x in range(len(loss_stats)):
+                        report_stats[x].update(loss_stats[x])
 
                 except Exception:
                     traceback.print_exc()
@@ -429,7 +465,7 @@ class Trainer(object):
         Returns:
             stat: the updated (or unchanged) stat object
         """
-        if stat is not None and self.n_gpu > 1:
+        if stat and self.n_gpu > 1:
             return onmt.utils.Statistics.all_gather_stats(stat)
         return stat
 

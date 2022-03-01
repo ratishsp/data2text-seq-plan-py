@@ -12,7 +12,7 @@ from functools import partial
 from collections import Counter, defaultdict
 
 from onmt.utils.logging import init_logger, logger
-from onmt.utils.misc import split_corpus
+from onmt.utils.misc import split_corpus, split_corpus_by_tgt_length
 import onmt.inputters as inputters
 import onmt.opts as opts
 from onmt.utils.parse import ArgumentParser
@@ -31,25 +31,29 @@ def check_existing_pt_files(opt):
             sys.exit(1)
 
 
-def build_save_dataset(corpus_type, fields, src_reader, tgt_reader, opt):
+def build_save_dataset(corpus_type, fields, src_reader, tgt_reader, tgt_chosen_pp_reader, opt):
     assert corpus_type in ['train', 'valid']
 
     if corpus_type == 'train':
         counters = defaultdict(Counter)
         srcs = opt.train_src
         tgts = opt.train_tgt
+        tgts_chosen_pp = opt.train_tgt_chosen_pp
         ids = opt.train_ids
     else:
         srcs = [opt.valid_src]
         tgts = [opt.valid_tgt]
+        tgts_chosen_pp = [opt.valid_tgt_chosen_pp]
         ids = [None]
 
-    for src, tgt, maybe_id in zip(srcs, tgts, ids):
-        logger.info("Reading source and target files: %s %s." % (src, tgt))
+    for src, tgt, tgt_chosen_pp, maybe_id in zip(srcs, tgts, tgts_chosen_pp, ids):
+        logger.info("Reading source, target and target chosen pp files: %s %s %s." % (
+        src, tgt, tgt_chosen_pp))
 
         src_shards = split_corpus(src, opt.shard_size)
         tgt_shards = split_corpus(tgt, opt.shard_size)
-        shard_pairs = zip(src_shards, tgt_shards)
+        tgt_chosen_pp_shards = split_corpus(tgt_chosen_pp, opt.shard_size)
+        shard_pairs = zip(src_shards, tgt_shards, tgt_chosen_pp_shards)
         dataset_paths = []
         if (corpus_type == "train" or opt.filter_valid) and tgt is not None:
             filter_pred = partial(
@@ -79,17 +83,18 @@ def build_save_dataset(corpus_type, fields, src_reader, tgt_reader, opt):
             else:
                 tgt_vocab = None
 
-        for i, (src_shard, tgt_shard) in enumerate(shard_pairs):
+        for i, (src_shard, tgt_shard, tgt_chosen_pp_shard) in enumerate(shard_pairs):
             assert len(src_shard) == len(tgt_shard)
+            assert len(src_shard) == len(tgt_chosen_pp_shard)
             logger.info("Building shard %d." % i)
             dataset = inputters.Dataset(
                 fields,
-                readers=([src_reader, tgt_reader]
+                readers=([src_reader, tgt_reader, tgt_chosen_pp_reader]
                          if tgt_reader else [src_reader]),
-                data=([("src", src_shard), ("tgt", tgt_shard)]
+                data=([("src", src_shard), ("tgt", tgt_shard), ("tgt_chosen_pp", tgt_chosen_pp_shard)]
                       if tgt_reader else [("src", src_shard)]),
-                dirs=([opt.src_dir, None]
-                      if tgt_reader else [opt.src_dir]),
+                dirs=([opt.src_dir, opt.src_dir, None]
+                      if tgt_reader else [opt.src_dir, opt.src_dir]),
                 sort_key=inputters.str2sortkey[opt.data_type],
                 filter_pred=filter_pred
             )
@@ -134,6 +139,7 @@ def build_save_dataset(corpus_type, fields, src_reader, tgt_reader, opt):
     if corpus_type == "train":
         vocab_path = opt.save_data + '.vocab.pt'
         if existing_fields is None:
+            counters['tgt_lengths'] = Counter({"<end-summary-bin>":1 , "<LENGTH0>":1, "<LENGTH1>":1, "<LENGTH2>":1})
             fields = _build_fields_vocab(
                 fields, counters, opt.data_type,
                 opt.share_vocab, opt.vocab_size_multiple,
@@ -167,6 +173,7 @@ def count_features(path):
 
 
 def main(opt):
+    print(opt)
     ArgumentParser.validate_preprocess_args(opt)
     torch.manual_seed(opt.seed)
     if not(opt.overwrite):
@@ -195,14 +202,15 @@ def main(opt):
 
     src_reader = inputters.str2reader[opt.data_type].from_opt(opt)
     tgt_reader = inputters.str2reader["text"].from_opt(opt)
+    tgt_chosen_pp_reader = inputters.str2reader["text"].from_opt(opt)
 
     logger.info("Building & saving training data...")
     build_save_dataset(
-        'train', fields, src_reader, tgt_reader, opt)
+        'train', fields, src_reader, tgt_reader, tgt_chosen_pp_reader, opt)
 
     if opt.valid_src and opt.valid_tgt:
         logger.info("Building & saving validation data...")
-        build_save_dataset('valid', fields, src_reader, tgt_reader, opt)
+        build_save_dataset('valid', fields, src_reader, tgt_reader, tgt_chosen_pp_reader, opt)
 
 
 def _get_parser():

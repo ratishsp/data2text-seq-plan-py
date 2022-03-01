@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from onmt.utils.misc import aeq
 from onmt.utils.loss import NMTLossCompute
+from onmt.utils.statistics import StatisticsTypes
 
 
 def collapse_copy_scores(scores, batch, tgt_vocab, src_vocabs=None,
@@ -92,7 +93,7 @@ class CopyGenerator(nn.Module):
         self.linear_copy = nn.Linear(input_size, 1)
         self.pad_idx = pad_idx
 
-    def forward(self, hidden, attn, src_map):
+    def forward(self, hidden, attn, src_map, cvocab=None):
         """
         Compute a distribution over the target dictionary
         extended by the dynamic dictionary implied by copying
@@ -110,7 +111,7 @@ class CopyGenerator(nn.Module):
         # CHECKS
         batch_by_tlen, _ = hidden.size()
         batch_by_tlen_, slen = attn.size()
-        slen_, batch, cvocab = src_map.size()
+        slen_, batch = src_map.size()
         aeq(batch_by_tlen, batch_by_tlen_)
         aeq(slen, slen_)
 
@@ -124,11 +125,11 @@ class CopyGenerator(nn.Module):
         # Probability of not copying: p_{word}(w) * (1 - p(z))
         out_prob = torch.mul(prob, 1 - p_copy)
         mul_attn = torch.mul(attn, p_copy)
-        copy_prob = torch.bmm(
-            mul_attn.view(-1, batch, slen).transpose(0, 1),
-            src_map.transpose(0, 1)
-        ).transpose(0, 1)
-        copy_prob = copy_prob.contiguous().view(-1, cvocab)
+        tlen = batch_by_tlen_ // batch
+        copy_prob = torch.zeros(batch, tlen, cvocab, device=mul_attn.device)
+        copy_prob.scatter_add_(-1, src_map.transpose(0, 1).unsqueeze(1).expand(-1, batch_by_tlen_//batch, -1).long(), mul_attn.view(-1, batch, slen).transpose(0, 1))
+        copy_prob = copy_prob.view(batch, tlen, cvocab)
+        copy_prob = copy_prob.transpose(0, 1).contiguous().view(-1, cvocab)
         return torch.cat([out_prob, copy_prob], 1)
 
 
@@ -179,10 +180,14 @@ class CopyGeneratorLoss(nn.Module):
 
 class CopyGeneratorLossCompute(NMTLossCompute):
     """Copy Generator Loss Computation."""
-    def __init__(self, criterion, generator, tgt_vocab, normalize_by_length,
-                 lambda_coverage=0.0):
+    def __init__(self, criterion, pp_selection_criterion, generator, tgt_vocab, normalize_by_length,
+                 lambda_coverage=0.0, label_smoothing_pp_selection=None,
+                 pp_prediction_loss_multiplier=None, kl_loss_multiplier=None):
         super(CopyGeneratorLossCompute, self).__init__(
-            criterion, generator, lambda_coverage=lambda_coverage)
+            criterion, pp_selection_criterion, generator, lambda_coverage=lambda_coverage,
+            label_smoothing_pp_selection=label_smoothing_pp_selection,
+            pp_prediction_loss_multiplier=pp_prediction_loss_multiplier,
+            kl_loss_multiplier=kl_loss_multiplier)
         self.tgt_vocab = tgt_vocab
         self.normalize_by_length = normalize_by_length
 
@@ -201,7 +206,7 @@ class CopyGeneratorLossCompute(NMTLossCompute):
         })
         return shard_state
 
-    def _compute_loss(self, batch, output, target, copy_attn, align,
+    def _compute_loss(self, batch, chosen_sentences_id_with_batch_indices, output, target, copy_attn, align,
                       std_attn=None, coverage_attn=None):
         """Compute the loss.
 
@@ -214,10 +219,25 @@ class CopyGeneratorLossCompute(NMTLossCompute):
             copy_attn: the copy attention value.
             align: the align info.
         """
+        batch_size, num_steps = chosen_sentences_id_with_batch_indices.size()
+        assert batch.batch_size == batch_size
+        assert batch_size * num_steps == target.size(1)
+        dense_src_map = batch.src_map
+        batch_src_map = dense_src_map.view(dense_src_map.size(0), batch_size, -1)
+        cvocab = max([t.max() for t in batch_src_map]) + 1
+        cvocab = int(cvocab.item())
+        chosen_sentences_id_expand = chosen_sentences_id_with_batch_indices.unsqueeze(-1).expand(-1, -1, dense_src_map.size(0))
+        src_map = torch.gather(batch_src_map.transpose(0, 1).transpose(1, 2), 1, chosen_sentences_id_expand)  # batch_size, num_steps, slen
+        src_map = src_map.transpose(0, 2)
+        src_map = torch.cat([torch.zeros(1, num_steps, batch_size, device=src_map.device), src_map], dim=0)
+        src_map[0, :, :] = 1  # setting the src_map for bin position for all turns as pad_index for mlb
+        src_map = src_map.transpose(1, 2).contiguous()
+        src_map = src_map.view(src_map.size(0), batch_size * num_steps)
+
         target = target.view(-1)
         align = align.view(-1)
         scores = self.generator(
-            self._bottle(output), self._bottle(copy_attn), batch.src_map
+            self._bottle(output), self._bottle(copy_attn), src_map, cvocab
         )
         loss = self.criterion(scores, align, target)
 
@@ -228,9 +248,12 @@ class CopyGeneratorLossCompute(NMTLossCompute):
 
         # this block does not depend on the loss value computed above
         # and is used only for stats
-        scores_data = collapse_copy_scores(
-            self._unbottle(scores.clone(), batch.batch_size),
-            batch, self.tgt_vocab, None)
+        scores_view = self._unbottle(scores.clone(), batch.batch_size * num_steps)
+        scores_view = scores_view.view(-1, batch.batch_size, num_steps, scores_view.size(2))
+        scores_view = scores_view.transpose(1, 2).contiguous().view(-1, batch.batch_size, scores_view.size(3))
+        scores_data = collapse_copy_scores(scores_view, batch, self.tgt_vocab, src_vocabs=None)
+        scores_data = scores_data.view(-1, num_steps, batch.batch_size, scores_data.size(2)).transpose(1, 2).contiguous()
+        scores_data = scores_data.view(-1, batch.batch_size * num_steps, scores_data.size(3))
         scores_data = self._bottle(scores_data)
 
         # this block does not depend on the loss value computed above
@@ -245,7 +268,7 @@ class CopyGeneratorLossCompute(NMTLossCompute):
         target_data[correct_mask] += offset_align
 
         # Compute sum of perplexities for stats
-        stats = self._stats(loss.sum().clone(), scores_data, target_data)
+        stats = self._stats(loss.sum().clone(), scores_data, target_data, name=StatisticsTypes.SUMMARY.name)
 
         # this part looks like it belongs in CopyGeneratorLoss
         if self.normalize_by_length:

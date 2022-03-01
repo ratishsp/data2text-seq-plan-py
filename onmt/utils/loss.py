@@ -8,8 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import onmt
+from onmt.utils.statistics import StatisticsTypes
 from onmt.modules.sparse_losses import SparsemaxLoss
 from onmt.modules.sparse_activations import LogSparsemax
+from onmt.utils.misc import sequence_mask
 
 
 def build_loss_compute(model, tgt_field, opt, train=True):
@@ -30,6 +32,7 @@ def build_loss_compute(model, tgt_field, opt, train=True):
         assert opt.coverage_attn, "--coverage_attn needs to be set in " \
             "order to use --lambda_coverage != 0"
 
+    label_smoothing_pp_selection = False
     if opt.copy_attn:
         criterion = onmt.modules.CopyGeneratorLoss(
             len(tgt_field.vocab), opt.copy_attn_force,
@@ -43,6 +46,11 @@ def build_loss_compute(model, tgt_field, opt, train=True):
         criterion = SparsemaxLoss(ignore_index=padding_idx, reduction='sum')
     else:
         criterion = nn.NLLLoss(ignore_index=padding_idx, reduction='sum')
+    if opt.label_smoothing_pp_selection > 0 and train:
+        pp_selection_criterion = LabelSmoothingLossConfigurableTargetSize(opt.label_smoothing_pp_selection, ignore_index=padding_idx)
+        label_smoothing_pp_selection = True
+    else:
+        pp_selection_criterion = nn.NLLLoss(ignore_index=padding_idx, reduction='sum')
 
     # if the loss function operates on vectors of raw logits instead of
     # probabilities, only the first part of the generator needs to be
@@ -52,12 +60,15 @@ def build_loss_compute(model, tgt_field, opt, train=True):
     loss_gen = model.generator[0] if use_raw_logits else model.generator
     if opt.copy_attn:
         compute = onmt.modules.CopyGeneratorLossCompute(
-            criterion, loss_gen, tgt_field.vocab, opt.copy_loss_by_seqlength,
-            lambda_coverage=opt.lambda_coverage
+            criterion, pp_selection_criterion, loss_gen, tgt_field.vocab, opt.copy_loss_by_seqlength,
+            lambda_coverage=opt.lambda_coverage, label_smoothing_pp_selection=label_smoothing_pp_selection,
+            pp_prediction_loss_multiplier=opt.pp_prediction_loss_multiplier, kl_loss_multiplier=opt.kl_loss_multiplier
         )
     else:
         compute = NMTLossCompute(
-            criterion, loss_gen, lambda_coverage=opt.lambda_coverage)
+            criterion, pp_selection_criterion, loss_gen, lambda_coverage=opt.lambda_coverage,
+            label_smoothing_pp_selection=label_smoothing_pp_selection,
+            pp_prediction_loss_multiplier=opt.pp_prediction_loss_multiplier, kl_loss_multiplier=opt.kl_loss_multiplier)
     compute.to(device)
 
     return compute
@@ -82,10 +93,15 @@ class LossComputeBase(nn.Module):
         normalzation (str): normalize by "sents" or "tokens"
     """
 
-    def __init__(self, criterion, generator):
+    def __init__(self, criterion, pp_selection_criterion, generator, label_smoothing_pp_selection,
+                 pp_prediction_loss_multiplier, kl_loss_multiplier):
         super(LossComputeBase, self).__init__()
         self.criterion = criterion
+        self.pp_selection_criterion = pp_selection_criterion
         self.generator = generator
+        self.label_smoothing_pp_selection = label_smoothing_pp_selection
+        self.pp_prediction_loss_multiplier = pp_prediction_loss_multiplier
+        self.kl_loss_multiplier =  kl_loss_multiplier
 
     @property
     def padding_idx(self):
@@ -105,7 +121,7 @@ class LossComputeBase(nn.Module):
         """
         return NotImplementedError
 
-    def _compute_loss(self, batch, output, target, **kwargs):
+    def _compute_loss(self, batch, chosen_sentences_id_with_batch_indices, output, target, **kwargs):
         """
         Compute the loss. Subclass must define this method.
 
@@ -125,7 +141,12 @@ class LossComputeBase(nn.Module):
                  normalization=1.0,
                  shard_size=0,
                  trunc_start=0,
-                 trunc_size=None):
+                 trunc_size=None,
+                 prior_attentions=None,
+                 posterior_attentions=None,
+                 pp_mask=None,
+                 training_step=None,
+                 chosen_sentences_id_with_batch_indices=None):
         """Compute the forward loss, possibly in shards in which case this
         method also runs the backward pass and returns ``None`` as the loss
         value.
@@ -158,16 +179,56 @@ class LossComputeBase(nn.Module):
         trunc_range = (trunc_start, trunc_start + trunc_size)
         shard_state = self._make_shard_state(batch, output, trunc_range, attns)
         if shard_size == 0:
-            loss, stats = self._compute_loss(batch, **shard_state)
-            return loss / float(normalization), stats
-        batch_stats = onmt.utils.Statistics()
+            loss, stats = self._compute_loss(batch, chosen_sentences_id_with_batch_indices, **shard_state)
+            loss_, pp_selection_stats = self.compute_pp_selection_loss(batch, posterior_attentions, pp_mask,
+                                                                       prior_attentions)
+            loss += loss_
+            stats_list = [stats]
+            stats_list.extend(pp_selection_stats)
+            return loss / float(normalization), stats_list
+        batch_stats = onmt.utils.Statistics(name=StatisticsTypes.SUMMARY.name)
         for shard in shards(shard_state, shard_size):
-            loss, stats = self._compute_loss(batch, **shard)
+            loss, stats = self._compute_loss(batch, chosen_sentences_id_with_batch_indices, **shard)
             loss.div(float(normalization)).backward()
             batch_stats.update(stats)
-        return None, batch_stats
+        loss, pp_selection_stats = self.compute_pp_selection_loss(batch, posterior_attentions, pp_mask, prior_attentions)
+        loss.div(float(normalization)).backward()
+        stats_list = [batch_stats]
+        stats_list.extend(pp_selection_stats)
+        return None, stats_list
 
-    def _stats(self, loss, scores, target):
+    def compute_pp_selection_loss(self, batch, posterior_attentions, pp_mask, prior_attentions):
+        gtruth_chosen_pp = batch.tgt_chosen_pp.view(-1)
+        bottled_posterior_attentions = self._bottle(posterior_attentions)
+        paragraph_batch_ = prior_attentions.size()[1]
+        if self.label_smoothing_pp_selection:
+            loss = self.pp_selection_criterion(bottled_posterior_attentions, gtruth_chosen_pp,
+                                               bottled_posterior_attentions.size(-1), pp_mask)
+        else:
+            loss = self.pp_selection_criterion(bottled_posterior_attentions, gtruth_chosen_pp)
+        loss = self.pp_prediction_loss_multiplier * loss
+        posterior_stats = self._stats(loss.clone(), bottled_posterior_attentions, gtruth_chosen_pp, name=StatisticsTypes.POSTERIOR_PP_SELECTION.name)
+        bottled_prior_attentions = self._bottle(prior_attentions)
+        if self.label_smoothing_pp_selection:
+            prior_loss = self.pp_selection_criterion(bottled_prior_attentions, gtruth_chosen_pp,
+                                                     bottled_prior_attentions.size(-1), pp_mask)
+        else:
+            prior_loss = self.pp_selection_criterion(bottled_prior_attentions, gtruth_chosen_pp)
+        prior_stats = self._stats(prior_loss.clone(), bottled_prior_attentions, gtruth_chosen_pp, name=StatisticsTypes.PRIOR_PP_SELECTION.name)
+        klloss = F.kl_div(bottled_prior_attentions, torch.exp(bottled_posterior_attentions), reduction='none')
+        paragraph_batch_ = prior_attentions.size()[1]
+        bottled_pp_mask = sequence_mask(pp_mask).unsqueeze(1).expand(-1, paragraph_batch_, -1)
+        bottled_pp_mask = bottled_pp_mask.reshape(-1, bottled_pp_mask.size(2))
+        klloss.masked_fill_(~bottled_pp_mask, 0)
+        klloss = klloss.sum()
+        klloss = self.kl_loss_multiplier * klloss
+        klloss_stats = self._stats(klloss.clone(), bottled_prior_attentions,
+                                   torch.argmax(bottled_posterior_attentions, dim=-1),
+                                   name=StatisticsTypes.KL_PRIOR_POSTERIOR.name)
+        loss += klloss
+        return loss, [posterior_stats, prior_stats, klloss_stats]
+
+    def _stats(self, loss, scores, target, name=StatisticsTypes.STAT.name):
         """
         Args:
             loss (:obj:`FloatTensor`): the loss computed by the loss criterion.
@@ -181,7 +242,7 @@ class LossComputeBase(nn.Module):
         non_padding = target.ne(self.padding_idx)
         num_correct = pred.eq(target).masked_select(non_padding).sum().item()
         num_non_padding = non_padding.sum().item()
-        return onmt.utils.Statistics(loss.item(), num_non_padding, num_correct)
+        return onmt.utils.Statistics(loss.item(), num_non_padding, num_correct, name=name)
 
     def _bottle(self, _v):
         return _v.view(-1, _v.size(2))
@@ -220,20 +281,51 @@ class LabelSmoothingLoss(nn.Module):
         return F.kl_div(output, model_prob, reduction='sum')
 
 
+class LabelSmoothingLossConfigurableTargetSize(nn.Module):
+    def __init__(self, label_smoothing, ignore_index=-100):
+        assert 0.0 < label_smoothing <= 1.0
+        self.ignore_index = ignore_index
+        super(LabelSmoothingLossConfigurableTargetSize, self).__init__()
+        self.label_smoothing = label_smoothing
+
+        self.confidence = 1.0 - label_smoothing
+
+    def forward(self, output, target, tgt_vocab_size, pp_lengths):
+        """
+        :param output (FloatTensor): batch_size x n_classes
+        :param target (LongTensor): batch_size
+        :param tgt_vocab_size (scalar):
+        :return:
+        """
+        smoothing_value = torch.div(self.label_smoothing, (pp_lengths - 2))
+        smoothing_value = smoothing_value.unsqueeze(-1).unsqueeze(-1)
+        model_prob = smoothing_value.repeat(1, target.size(0)//pp_lengths.size(0), tgt_vocab_size)
+        model_prob = model_prob.contiguous().view(-1, tgt_vocab_size)
+        model_prob[:, self.ignore_index] = 0
+        model_prob.scatter_(1, target.unsqueeze(1), self.confidence)
+        model_prob.masked_fill_((target == self.ignore_index).unsqueeze(1), 0)
+        bottled_pp_mask = sequence_mask(pp_lengths).unsqueeze(1).repeat(1, target.size(0)//pp_lengths.size(0), 1)
+        bottled_pp_mask = bottled_pp_mask.view(-1, bottled_pp_mask.size(2))
+        model_prob.masked_fill_(~bottled_pp_mask, 0)
+        return F.kl_div(output, model_prob, reduction='sum')
+
+
 class NMTLossCompute(LossComputeBase):
     """
     Standard NMT Loss Computation.
     """
 
-    def __init__(self, criterion, generator, normalization="sents",
-                 lambda_coverage=0.0):
-        super(NMTLossCompute, self).__init__(criterion, generator)
+    def __init__(self, criterion, pp_selection_criterion, generator, normalization="sents",
+                 lambda_coverage=0.0, label_smoothing_pp_selection=None,
+                 pp_prediction_loss_multiplier=1.0, kl_loss_multiplier=1.0):
+        super(NMTLossCompute, self).__init__(criterion, pp_selection_criterion, generator, label_smoothing_pp_selection,
+                                             pp_prediction_loss_multiplier, kl_loss_multiplier)
         self.lambda_coverage = lambda_coverage
 
     def _make_shard_state(self, batch, output, range_, attns=None):
         shard_state = {
             "output": output,
-            "target": batch.tgt[range_[0] + 1: range_[1], :, 0],
+            "target": batch.tgt[range_[0] + 1: range_[1], :, 0]
         }
         if self.lambda_coverage != 0.0:
             coverage = attns.get("coverage", None)
@@ -259,11 +351,12 @@ class NMTLossCompute(LossComputeBase):
         gtruth = target.view(-1)
 
         loss = self.criterion(scores, gtruth)
+
         if self.lambda_coverage != 0.0:
             coverage_loss = self._compute_coverage_loss(
                 std_attn=std_attn, coverage_attn=coverage_attn)
             loss += coverage_loss
-        stats = self._stats(loss.clone(), scores, gtruth)
+        stats = self._stats(loss.clone(), scores, gtruth, name="summary")
 
         return loss, stats
 
@@ -335,4 +428,4 @@ def shards(state, shard_size, eval_only=False):
                 variables.extend(zip(torch.split(state[k], shard_size),
                                      [v_chunk.grad for v_chunk in v_split]))
         inputs, grads = zip(*variables)
-        torch.autograd.backward(inputs, grads)
+        torch.autograd.backward(inputs, grads, retain_graph=True)

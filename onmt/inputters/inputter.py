@@ -41,20 +41,168 @@ Vocab.__setstate__ = _setstate
 
 
 def make_src(data, vocab):
-    src_size = max([t.size(0) for t in data])
-    src_vocab_size = max([t.max() for t in data]) + 1
-    alignment = torch.zeros(src_size, len(data), src_vocab_size)
+    segment_counts = []
+    segment_lengths_list = []
+    _prefix_code = [1, 1, 1, 1, 1, 1]
+    get_lengths_and_counts_align(data, segment_counts, segment_lengths_list, prefix=True, eos=False)
+    longest_segment = max([max(x) for x in segment_lengths_list])
+    alignment = torch.zeros(longest_segment, len(data), max(segment_counts))
     for i, sent in enumerate(data):
-        for j, t in enumerate(sent):
-            alignment[j, i, t] = 1
+        prev_index = 0
+        segment_lengths = segment_lengths_list[i]
+        for j in range(len(_prefix_code)):
+            alignment[: segment_lengths[j], i, j] = torch.LongTensor(sent[prev_index: prev_index + segment_lengths[j]])
+            prev_index += segment_lengths[j]
+        for j in range(len(_prefix_code), segment_counts[i]):
+            alignment[: segment_lengths[j], i, j] = torch.LongTensor(
+                sent[prev_index + 1: prev_index + segment_lengths[j] + 1])
+            prev_index += segment_lengths[j] + 1  # +1 to handle <segment> marker
+    alignment = alignment.view(longest_segment, -1)
     return alignment
 
 
 def make_tgt(data, vocab):
+    segment_counts = []
+    segment_lengths_list = []
+    get_lengths_and_counts_align(data, segment_counts, segment_lengths_list, prefix=False, eos=True)
+    tgt_size = max([max(x) for x in segment_lengths_list]) + 2  # +2 for bos and eos
+    alignment = torch.zeros(tgt_size, len(data), max(segment_counts)).long()
+    for i, sent in enumerate(data):
+        prev_index = 1 # the data already contains <UNK> at the beginning and end, so avoiding the marker by
+        # incrementing the counter
+        segment_lengths = segment_lengths_list[i]
+        for j in range(segment_counts[i]):
+            alignment[0, i, j] = 0  # UNK index
+            alignment[1: segment_lengths[j] + 1, i, j] = torch.LongTensor(
+                sent[prev_index + 1: prev_index + segment_lengths[j] + 1])  # +1 to avoid segment marker
+            alignment[segment_lengths[j] + 1, i, j] = 0   # UNK index
+            prev_index += segment_lengths[j] + 1
+    alignment = alignment.view(tgt_size, -1)
+    return alignment
+
+
+def make_src_pp(data, vocab):
+    segment_counts = []
+    segment_lengths_list = []
+    _prefix_code = [1, 1, 1, 1, 1, 1]
+    get_lengths_and_counts_pp(data, segment_counts, segment_lengths_list, vocab, prefix=True)
+    longest_segment = max([max(x) for x in segment_lengths_list])
+    src_paragraphs = torch.zeros(len(data), max(segment_counts), longest_segment).long().fill_(vocab.stoi["<blank>"])
+    for i, sent in enumerate(data):
+        prev_index = 0
+        segment_lengths = segment_lengths_list[i]
+        for j in range(len(_prefix_code)):
+            src_paragraphs[i, j, :segment_lengths[j]] = torch.Tensor(sent[prev_index: prev_index + segment_lengths[j]])
+            prev_index += segment_lengths[j]
+        for j in range(len(_prefix_code), segment_counts[i]):
+            src_paragraphs[i, j, :segment_lengths[j]] = torch.Tensor(
+                sent[prev_index + 1: prev_index + segment_lengths[j] + 1])
+            prev_index += segment_lengths[j] + 1  # +1 to handle <segment> marker
+    src_paragraphs = src_paragraphs.view(([-1, longest_segment]))
+    return src_paragraphs
+
+
+def make_tgt_paragraph(data, vocab):
+    segment_counts = []
+    segment_lengths_list = []
+    get_lengths_and_counts_pp(data, segment_counts, segment_lengths_list, vocab, prefix=False, eos=True)
+    longest_segment = max([max(x) for x in segment_lengths_list]) + 2  # +2 for bos and eos
+    tgt_paragraphs = torch.zeros(len(data), max(segment_counts), longest_segment).long().fill_(vocab.stoi["<blank>"])
+    for i, sent in enumerate(data):
+        prev_index = 1  # the data already contains <s> </s> markers, so avoiding the marker by incrementing the counter
+        segment_lengths = segment_lengths_list[i]
+        for j in range(segment_counts[i]):  # iterate through the count of segments in i
+            tgt_paragraphs[i, j, 0] = vocab.stoi["<s>"]
+            tgt_paragraphs[i, j, 1: segment_lengths[j] + 1] = torch.Tensor(
+                sent[prev_index + 1: prev_index + segment_lengths[j] + 1])  # +1 to avoid <segment> marker
+            tgt_paragraphs[i, j, segment_lengths[j] + 1] = vocab.stoi["</s>"]
+            prev_index += segment_lengths[j] + 1
+    tgt_paragraphs = tgt_paragraphs.view([-1, longest_segment])
+    return tgt_paragraphs
+
+
+def get_lengths_and_counts_align(data, segment_counts, segments_lengths_list, prefix=False, eos=False):
+    _prefix_code = [1, 1, 1, 1, 1, 1] if prefix else []  # UNK, PAD, BOS, EOS, <end-plan> <empty-segment>
+    PAD_INDEX = 1
+    for t in data:
+        segment_marker = t[6] if prefix else t[1]
+        indices = [index for index, x in enumerate(t) if x == segment_marker]
+        segments_lengths = _prefix_code + [t - s - 1 for s, t in zip(indices, indices[1:])]
+        end_length = (2 + t[2:].index(PAD_INDEX)) if PAD_INDEX in t[2:] else len(t)
+        if eos:
+            end_length = end_length - 1
+        segments_lengths = segments_lengths + [end_length - indices[-1] - 1]
+        segments_lengths_list.append(segments_lengths)
+        segment_counts.append(len(segments_lengths))
+        assert len(segments_lengths) == len(indices) + len(_prefix_code)
+        bos_eos = 2 if eos else 0
+        assert sum(segments_lengths) + len(segments_lengths) - len(_prefix_code) + bos_eos == len(t)
+
+
+def get_lengths_and_counts_pp(data, segment_counts, segment_lengths_list, vocab, prefix=False, eos=False):
+    _prefix_code = [1, 1, 1, 1, 1, 1] if prefix else []  # UNK, PAD, BOS, EOS, <end-plan> <empty-segment>
+    for t in data:
+        indices = [index for index, x in enumerate(t) if x == vocab.stoi["<segment>"]]
+        segment_lengths = _prefix_code + [t - s - 1 for s, t in zip(indices, indices[1:])]
+        end_length = (indices[-1] + t[indices[-1]:].index(vocab.stoi["<blank>"])) if vocab.stoi["<blank>"] in t[indices[-1]:] else len(t)
+        # omit the first occurrence which occurs at position 1 (zero indexed)
+        if eos:  # in case of tgt, there is eos, so -1 for that
+            end_length = end_length - 1
+        segment_lengths = segment_lengths + [end_length - indices[-1] - 1]
+        segment_lengths_list.append(segment_lengths)
+        segment_counts.append(len((segment_lengths)))
+        assert len(segment_lengths) == len(indices) + len(_prefix_code)  # +4 for UNK, PAD, BOS, EOS
+        bos_eos = 1 if eos else 0 # only considering bos
+        assert sum(segment_lengths) + len(segment_lengths) - len(_prefix_code) + bos_eos == end_length
+
+
+def make_summary_context(data, vocab):
+    segment_counts = []
+    segment_lengths_list = []
+    get_lengths_and_counts_pp(data, segment_counts, segment_lengths_list, vocab, prefix=False)
+    longest_segment = max([max(x) for x in segment_lengths_list])
+    tgt_paragraphs = torch.zeros(len(data), max(segment_counts), longest_segment).long().fill_(vocab.stoi["<blank>"])
+    for i, sent in enumerate(data):
+        prev_index = 0
+        segment_lengths = segment_lengths_list[i]
+        for j in range(segment_counts[i]):  # iterate through the count of segments in i
+            tgt_paragraphs[i, j, :segment_lengths[j]] = torch.Tensor(
+                sent[prev_index + 1: prev_index + segment_lengths[j] + 1])  # +1 to avoid <segment> marker
+            prev_index += segment_lengths[j] + 1
+    tgt_paragraphs = tgt_paragraphs.view([-1, longest_segment])
+    return tgt_paragraphs
+
+
+def make_pp_lengths(data, vocab):
+    segment_lengths_size = max([t.size(0) for t in data])
+    segment_lengths = torch.zeros(segment_lengths_size, len(data)).long().fill_(-1)
+    for i, sent in enumerate(data):
+        segment_lengths[:sent.size(0), i] = sent
+    return segment_lengths
+
+
+def make_context_lengths(data, vocab):
+    segment_lengths_size = max([t.size(0) for t in data])
+    segment_lengths = torch.zeros(segment_lengths_size, len(data)).long().fill_(1)  # fill 1 as positive length is
+    # required for lstm; we will manage for true lengths by making loss 0 for padding instances
+    for i, sent in enumerate(data):
+        segment_lengths[:sent.size(0), i] = sent
+    return segment_lengths
+
+
+def make_pp_count(data, vocab):
+    segment_count = torch.zeros(1, len(data)).long().fill_(-1)
+    for i, sent in enumerate(data):
+        segment_count[0][i] = data[i]
+    return segment_count
+
+
+def make_tgt_paragraph_plan(data, vocab):
     tgt_size = max([t.size(0) for t in data])
-    alignment = torch.zeros(tgt_size, len(data)).long()
+    alignment = torch.zeros(tgt_size, len(data)).fill_(1).long()  # PAD index
     for i, sent in enumerate(data):
         alignment[:sent.size(0), i] = sent
+    alignment = alignment.transpose(0,1).contiguous().view(-1).unsqueeze(0)
     return alignment
 
 
@@ -109,15 +257,31 @@ def get_fields(
                         "include_lengths": True,
                         "pad": pad, "bos": None, "eos": None,
                         "truncate": src_truncate,
-                        "base_name": "src"}
+                        "base_name": "src",
+                        "postprocessing": make_src_pp}
+
+    src_summary_ctx_field_kwargs = {"n_feats": n_src_feats,
+                        "include_lengths": False,
+                        "pad": pad, "bos": None, "eos": None,
+                        "truncate": src_truncate,
+                        "base_name": "src_summary_ctx",
+                        "postprocessing": make_summary_context}
+
     fields["src"] = fields_getters[src_data_type](**src_field_kwargs)
+
+    fields["src_summary_ctx"] = fields_getters["text"](**src_summary_ctx_field_kwargs)
 
     tgt_field_kwargs = {"n_feats": n_tgt_feats,
                         "include_lengths": False,
                         "pad": pad, "bos": bos, "eos": eos,
                         "truncate": tgt_truncate,
-                        "base_name": "tgt"}
+                        "base_name": "tgt",
+                        "postprocessing": make_tgt_paragraph}
     fields["tgt"] = fields_getters["text"](**tgt_field_kwargs)
+
+    fields["tgt_chosen_pp"] = Field(
+        use_vocab=False, dtype=torch.long,
+        postprocessing=make_tgt_paragraph_plan, sequential=False)
 
     indices = Field(use_vocab=False, dtype=torch.long, sequential=False)
     fields["indices"] = indices
@@ -135,6 +299,31 @@ def get_fields(
             use_vocab=False, dtype=torch.long,
             postprocessing=make_tgt, sequential=False)
         fields["alignment"] = align
+
+    fields["pp_lengths"] = Field(
+        use_vocab=False, dtype=torch.long,
+        postprocessing=make_pp_lengths, sequential=False)
+
+    fields["pp_count"] = Field(
+        use_vocab=False, dtype=torch.long,
+        postprocessing=make_pp_count, sequential=False)
+
+    summary_context_lengths = Field(
+        use_vocab=False, dtype=torch.long,
+        postprocessing=make_context_lengths, sequential=False)
+    fields["summary_context_lengths"] = summary_context_lengths
+
+    summary_context_count = Field(
+        use_vocab=False, dtype=torch.long,
+        postprocessing=make_pp_count, sequential=False)
+    fields["summary_context_count"] = summary_context_count
+
+    tgt_lengths_field_kwargs = {"n_feats": n_tgt_feats,
+                        "include_lengths": False,
+                        "pad": pad, "bos": None, "eos": None,
+                        "truncate": None,
+                        "base_name": "tgt_lengths"}
+    fields["tgt_lengths"] = fields_getters["text"](**tgt_lengths_field_kwargs)
 
     return fields
 
@@ -321,11 +510,25 @@ def _build_fields_vocab(fields, counters, data_type, share_vocab,
     build_fv_args = defaultdict(dict)
     build_fv_args["src"] = dict(
         max_size=src_vocab_size, min_freq=src_words_min_frequency)
+    build_fv_args["src_summary_ctx"] = dict(
+        max_size=src_vocab_size, min_freq=src_words_min_frequency)
+    src_summary_ctx_multifield = fields["src_summary_ctx"]
+    _build_fv_from_multifield(
+        src_summary_ctx_multifield,
+        counters,
+        build_fv_args,
+        size_multiple=vocab_size_multiple if not share_vocab else 1)
     build_fv_args["tgt"] = dict(
         max_size=tgt_vocab_size, min_freq=tgt_words_min_frequency)
     tgt_multifield = fields["tgt"]
     _build_fv_from_multifield(
         tgt_multifield,
+        counters,
+        build_fv_args,
+        size_multiple=vocab_size_multiple if not share_vocab else 1)
+    tgt_lengths_multifield = fields["tgt_lengths"]
+    _build_fv_from_multifield(
+        tgt_lengths_multifield,
         counters,
         build_fv_args,
         size_multiple=vocab_size_multiple if not share_vocab else 1)
@@ -776,11 +979,14 @@ def build_dataset_iter(corpus_type, fields, opt, is_train=True, multi=False):
     to iterate over. We implement simple ordered iterator strategy here,
     but more sophisticated strategy like curriculum learning is ok too.
     """
+    dataset_glob = opt.data + '.' + corpus_type + '.[0-9]*.pt'
     dataset_paths = list(sorted(
-        glob.glob(opt.data + '.' + corpus_type + '.[0-9]*.pt')))
+        glob.glob(dataset_glob),
+        key=lambda p: int(p.split(".")[-2])))
+
     if not dataset_paths:
         if is_train:
-            raise ValueError('Training data %s not found' % opt.data)
+            raise ValueError('Training data %s not found' % dataset_glob)
         else:
             return None
     if multi:

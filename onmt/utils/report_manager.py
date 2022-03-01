@@ -8,16 +8,15 @@ import onmt
 from onmt.utils.logging import logger
 
 
-def build_report_manager(opt):
-    if opt.tensorboard:
+def build_report_manager(opt, gpu_rank):
+    if opt.tensorboard and gpu_rank == 0:
         from torch.utils.tensorboard import SummaryWriter
         tensorboard_log_dir = opt.tensorboard_log_dir
 
         if not opt.train_from:
             tensorboard_log_dir += datetime.now().strftime("/%b-%d_%H-%M-%S")
 
-        writer = SummaryWriter(tensorboard_log_dir,
-                               comment="Unmt")
+        writer = SummaryWriter(tensorboard_log_dir, comment="Unmt")
     else:
         writer = None
 
@@ -42,7 +41,6 @@ class ReportMgrBase(object):
                 means that you will need to set it later or use `start()`
         """
         self.report_every = report_every
-        self.progress_step = 0
         self.start_time = start_time
 
     def start(self):
@@ -75,8 +73,7 @@ class ReportMgrBase(object):
                     onmt.utils.Statistics.all_gather_stats(report_stats)
             self._report_training(
                 step, num_steps, learning_rate, report_stats)
-            self.progress_step += 1
-            return onmt.utils.Statistics()
+            return [onmt.utils.Statistics(name=x.name)  for x in report_stats]
         else:
             return report_stats
 
@@ -124,36 +121,47 @@ class ReportMgr(ReportMgrBase):
         """
         See base class method `ReportMgrBase.report_training`.
         """
-        report_stats.output(step, num_steps,
-                            learning_rate, self.start_time)
+        output_report_stats = []
+        for _report_stats in report_stats:
+            if _report_stats.n_words == 0:
+                continue
+            _report_stats.output(step, num_steps,
+                                learning_rate, self.start_time)
 
-        # Log the progress using the number of batches on the x-axis.
-        self.maybe_log_tensorboard(report_stats,
-                                   "progress",
-                                   learning_rate,
-                                   self.progress_step)
-        report_stats = onmt.utils.Statistics()
+            # Log the progress using the number of batches on the x-axis.
+            self.maybe_log_tensorboard(_report_stats,
+                                       "progress_"+_report_stats.name,
+                                       learning_rate,
+                                       step)
+            _report_stats = onmt.utils.Statistics(_report_stats.name)
+            output_report_stats.append(_report_stats)
 
-        return report_stats
+        return output_report_stats
 
     def _report_step(self, lr, step, train_stats=None, valid_stats=None):
         """
         See base class method `ReportMgrBase.report_step`.
         """
-        if train_stats is not None:
-            self.log('Train perplexity: %g' % train_stats.ppl())
-            self.log('Train accuracy: %g' % train_stats.accuracy())
+        if train_stats:
+            for _train_stats in train_stats:
+                self.log('Train name: %s' % _train_stats.name)
+                self.log('Train perplexity: %g' % _train_stats.ppl())
+                self.log('Train accuracy: %g' % _train_stats.accuracy())
 
-            self.maybe_log_tensorboard(train_stats,
-                                       "train",
-                                       lr,
-                                       step)
+                self.maybe_log_tensorboard(_train_stats,
+                                           "train_"+_train_stats.name,
+                                           lr,
+                                           step)
 
-        if valid_stats is not None:
-            self.log('Validation perplexity: %g' % valid_stats.ppl())
-            self.log('Validation accuracy: %g' % valid_stats.accuracy())
+        if valid_stats:
+            for _valid_stats in valid_stats:
+                if _valid_stats.n_words == 0:
+                    continue
+                self.log('Validation name: %s' % _valid_stats.name)
+                self.log('Validation perplexity: %g' % _valid_stats.ppl())
+                self.log('Validation accuracy: %g' % _valid_stats.accuracy())
 
-            self.maybe_log_tensorboard(valid_stats,
-                                       "valid",
-                                       lr,
-                                       step)
+                self.maybe_log_tensorboard(_valid_stats,
+                                           "valid_"+_valid_stats.name,
+                                           lr,
+                                           step)

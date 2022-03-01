@@ -56,7 +56,7 @@ class DecodeStrategy(object):
 
     def __init__(self, pad, bos, eos, batch_size, device, parallel_paths,
                  min_length, block_ngram_repeat, exclusion_tokens,
-                 return_attention, max_length):
+                 return_attention, max_length, end_of_plan_idx, selected_pp_first_index):
 
         # magic indices
         self.pad = pad
@@ -67,6 +67,8 @@ class DecodeStrategy(object):
         self.predictions = [[] for _ in range(batch_size)]
         self.scores = [[] for _ in range(batch_size)]
         self.attention = [[] for _ in range(batch_size)]
+        self.batch_size = batch_size
+        self.beam_size = parallel_paths
 
         self.alive_seq = torch.full(
             [batch_size * parallel_paths, 1], self.bos,
@@ -81,14 +83,21 @@ class DecodeStrategy(object):
         self.block_ngram_repeat = block_ngram_repeat
         self.exclusion_tokens = exclusion_tokens
         self.return_attention = return_attention
-
         self.done = False
+        self.end_of_plan_idx = end_of_plan_idx
+        self.selected_pp_first_index = selected_pp_first_index
 
     def __len__(self):
         return self.alive_seq.shape[1]
 
     def ensure_min_length(self, log_probs):
-        if len(self) <= self.min_length:
+        if len(self) == 2:
+            log_probs_view = log_probs.view(self.batch_size, self.beam_size, -1)
+            for path_idx in range(self.selected_pp_first_index.shape[0]):
+                pp_first_index = self.selected_pp_first_index[path_idx]  # inspect each element in batch
+                if pp_first_index != self.end_of_plan_idx:
+                    log_probs_view[path_idx, :, self.eos] = -1e20
+        elif len(self) <= self.min_length:
             log_probs[:, self.eos] = -1e20
 
     def ensure_max_length(self):

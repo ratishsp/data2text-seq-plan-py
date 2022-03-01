@@ -5,7 +5,14 @@ import math
 import sys
 
 from onmt.utils.logging import logger
+from enum import Enum, auto
 
+class StatisticsTypes(Enum):
+    STAT = auto()
+    SUMMARY = auto()
+    POSTERIOR_PP_SELECTION = auto()
+    PRIOR_PP_SELECTION = auto()
+    KL_PRIOR_POSTERIOR = auto()
 
 class Statistics(object):
     """
@@ -17,12 +24,13 @@ class Statistics(object):
     * elapsed time
     """
 
-    def __init__(self, loss=0, n_words=0, n_correct=0):
+    def __init__(self, loss=0, n_words=0, n_correct=0, name=StatisticsTypes.STAT.name):
         self.loss = loss
         self.n_words = n_words
         self.n_correct = n_correct
         self.n_src_words = 0
         self.start_time = time.time()
+        self.name = name
 
     @staticmethod
     def all_gather_stats(stat, max_size=4096):
@@ -37,8 +45,8 @@ class Statistics(object):
         Returns:
             `Statistics`, the update stats object
         """
-        stats = Statistics.all_gather_stats_list([stat], max_size=max_size)
-        return stats[0]
+        stats = Statistics.all_gather_stats_list(stat, max_size=max_size)
+        return stats
 
     @staticmethod
     def all_gather_stats_list(stat_list, max_size=4096):
@@ -114,9 +122,10 @@ class Statistics(object):
         if num_steps > 0:
             step_fmt = "%s/%5d" % (step_fmt, num_steps)
         logger.info(
-            ("Step %s; acc: %6.2f; ppl: %5.2f; xent: %4.2f; " +
+            ("Step %s; name %s; acc: %6.2f; ppl: %5.2f; xent: %4.2f; " +
              "lr: %7.5f; %3.0f/%3.0f tok/s; %6.0f sec")
             % (step_fmt,
+               self.name,
                self.accuracy(),
                self.ppl(),
                self.xent(),

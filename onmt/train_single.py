@@ -70,7 +70,7 @@ def main(opt, device_id, batch_queue=None, semaphore=None):
         fields = vocab
 
     # Report src and tgt vocab sizes, including for features
-    for side in ['src', 'tgt']:
+    for side in ['src', 'src_summary_ctx', 'tgt']:
         f = fields[side]
         try:
             f_iter = iter(f)
@@ -142,5 +142,5 @@ def main(opt, device_id, batch_queue=None, semaphore=None):
         valid_iter=valid_iter,
         valid_steps=opt.valid_steps)
 
-    if opt.tensorboard:
+    if trainer.report_manager.tensorboard_writer is not None:
         trainer.report_manager.tensorboard_writer.close()

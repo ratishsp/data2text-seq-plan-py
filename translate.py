@@ -13,6 +13,7 @@ from onmt.utils.parse import ArgumentParser
 
 
 def main(opt):
+    print(opt)
     ArgumentParser.validate_translate_opts(opt)
     logger = init_logger(opt.log_file)
 

@@ -21,7 +21,75 @@ def _join_dicts(*args):
     return dict(chain(*[d.items() for d in args]))
 
 
-def _dynamic_dict(example, src_field, tgt_field):
+def _add_tgt_paragraph_plan(example, tgt_chosen_pp_field, tgt_field_attrib_name):
+    """
+    Add field for int version of tgt_plan
+    :param example:
+    :param tgt_chosen_pp_field:
+    :param tgt_field_attrib_name:
+    :return:
+    """
+    tgt_plan = tgt_chosen_pp_field.tokenize(example["tgt_chosen_pp"])
+    example[tgt_field_attrib_name] = torch.LongTensor([int(w) for w in tgt_plan])
+
+
+def _add_ctx_segment_details(example, src_field, src_field_attrib_name, length_attrib, count_attrib, prefix=False):
+    """
+    Creates fields for total number of records for each segment and total number of segment
+
+    :param example:
+    :param src_field:
+    :param src_field_attrib_name:
+    :param length_attrib:
+    :param count_attrib:
+    :return:
+    """
+    _prefix_code = [1, 1, 1, 1, 1, 1] if prefix else []  # UNK, PAD, BOS, EOS, <end-plan> <end-segment>
+    indices, segment_lengths, src = set_segment_lengths(_prefix_code, example, src_field, src_field_attrib_name)
+    example[length_attrib] = torch.LongTensor(segment_lengths)
+    example[count_attrib] = torch.LongTensor([len(segment_lengths)])
+    assert len(segment_lengths) == len(indices) + len(_prefix_code)
+    assert sum(segment_lengths) + len(segment_lengths) - len(_prefix_code) == len(src)
+
+
+def set_segment_lengths(_prefix_code, example, src_field, src_field_attrib_name):
+    src = src_field.tokenize(example[src_field_attrib_name])
+    indices = [index for index, x in enumerate(src) if x == "<segment>"]
+    segment_lengths = _prefix_code + [t - s - 1 for s, t in
+                                      zip(indices, indices[1:])]  # -1 discounting for <segment> marker
+    segment_lengths = segment_lengths + [(len(src) - indices[-1]) - 1]  # -1 discounting for <segment> marker
+    return indices, segment_lengths, src
+
+
+def _add_tgt_lengths(example, field, field_attrib_name, length_attrib):
+    _prefix_code = []
+    indices, segment_lengths, src = set_segment_lengths(_prefix_code, example, field, field_attrib_name)
+    example[length_attrib] = get_length_bin(segment_lengths)
+    assert len(segment_lengths) == len(indices) + len(_prefix_code)  # +4 for UNK, PAD, BOS, EOS
+    assert sum(segment_lengths) + len(segment_lengths) - len(_prefix_code) == len(src)
+
+"""
+(25, 7783) 113240
+(40, 7362) 119887
+counts 112802
+"""
+def get_length_bin(segment_lengths):
+    output_lengths = []
+    for length in segment_lengths:
+        if length == 1:
+            length_bin = "<end-summary-bin>"
+        elif length <= 25:
+            length_bin = "<LENGTH0>"
+        elif length <= 40:
+            length_bin = "<LENGTH1>"
+        else:
+            length_bin = "<LENGTH2>"
+        output_lengths.append(length_bin)
+
+    return output_lengths
+
+
+def _dynamic_dict(example, src_field, tgt_field, inference=False):
     """Create copy-vocab and numericalize with it.
 
     In-place adds ``"src_map"`` to ``example``. That is the copy-vocab
@@ -52,7 +120,7 @@ def _dynamic_dict(example, src_field, tgt_field):
     example["src_map"] = src_map
     example["src_ex_vocab"] = src_ex_vocab
 
-    if "tgt" in example:
+    if "tgt" in example and not inference:
         tgt = tgt_field.tokenize(example["tgt"])
         mask = torch.LongTensor(
             [unk_idx] + [src_ex_vocab.stoi[w] for w in tgt] + [unk_idx])
@@ -108,7 +176,7 @@ class Dataset(TorchtextDataset):
     """
 
     def __init__(self, fields, readers, data, dirs, sort_key,
-                 filter_pred=None):
+                 filter_pred=None, inference=False):
         self.sort_key = sort_key
         can_copy = 'src_map' in fields and 'alignment' in fields
 
@@ -124,8 +192,23 @@ class Dataset(TorchtextDataset):
                 tgt_field = fields['tgt']
                 # this assumes src_field and tgt_field are both text
                 src_ex_vocab, ex_dict = _dynamic_dict(
-                    ex_dict, src_field.base_field, tgt_field.base_field)
+                    ex_dict, src_field.base_field, tgt_field.base_field, inference=inference)
                 self.src_vocabs.append(src_ex_vocab)
+            _add_ctx_segment_details(ex_dict, fields['src'].base_field, "src", "pp_lengths", "pp_count",
+                                 prefix=True)
+            if inference and "tgt" not in ex_dict:
+                ex_dict["tgt_lengths"] = ["<LENGTH0>"]
+            if "tgt" in ex_dict:
+                ex_dict['src_summary_ctx'] = ex_dict['tgt']
+                _add_ctx_segment_details(ex_dict, fields['src_summary_ctx'].base_field, "src_summary_ctx",
+                                     "summary_context_lengths", "summary_context_count", prefix=False)
+                if inference:
+                    ex_dict["tgt_lengths"] = ["<LENGTH0>"] + ex_dict['tgt'].count("<segment>") * ["<LENGTH2>"]
+                else:
+                    _add_tgt_lengths(ex_dict, fields['tgt'].base_field, "tgt", "tgt_lengths")
+
+            if "tgt_chosen_pp" in ex_dict:
+                _add_tgt_paragraph_plan(ex_dict, fields['tgt'].base_field, "tgt_chosen_pp")
             ex_fields = {k: [(k, v)] for k, v in fields.items() if
                          k in ex_dict}
             ex = Example.fromdict(ex_dict, ex_fields)

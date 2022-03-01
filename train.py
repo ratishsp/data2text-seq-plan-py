@@ -18,6 +18,7 @@ from itertools import cycle
 
 
 def main(opt):
+    print(opt)
     ArgumentParser.validate_train_opts(opt)
     ArgumentParser.update_model_opts(opt)
     ArgumentParser.validate_model_opts(opt)
@@ -125,6 +126,24 @@ def batch_producer(generator_to_serve, queues, semaphore, opt):
             if hasattr(b, 'alignment') else None
         b.src_map = b.src_map.to(torch.device(device_id)) \
             if hasattr(b, 'src_map') else None
+        b.src_summary_ctx = b.src_summary_ctx.to(torch.device(device_id)) \
+            if hasattr(b, 'src_summary_ctx') else None
+        b.tgt_chosen_pp = b.tgt_chosen_pp.to(torch.device(device_id)) \
+            if hasattr(b, 'tgt_chosen_pp') else None
+        b.segment_lengths = b.segment_lengths.to(torch.device(device_id)) \
+            if hasattr(b, 'segment_lengths') else None
+        b.segment_count = b.segment_count.to(torch.device(device_id)) \
+            if hasattr(b, 'segment_count') else None
+        b.summary_context_lengths = b.summary_context_lengths.to(torch.device(device_id)) \
+            if hasattr(b, 'summary_context_lengths') else None
+        b.summary_context_count = b.summary_context_count.to(torch.device(device_id)) \
+            if hasattr(b, 'summary_context_count') else None
+        b.pp_lengths = b.pp_lengths.to(torch.device(device_id)) \
+            if hasattr(b, 'pp_lengths') else None
+        b.pp_count = b.pp_count.to(torch.device(device_id)) \
+            if hasattr(b, 'pp_count') else None
+        b.tgt_lengths = b.tgt_lengths.to(torch.device(device_id)) \
+            if hasattr(b, 'tgt_lengths') else None
 
         # hack to dodge unpicklable `dict_keys`
         b.fields = list(b.fields)
