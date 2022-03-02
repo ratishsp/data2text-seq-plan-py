@@ -20,3 +20,7 @@ All dependencies can be installed via:
 pip install -r requirements.txt
 ```
 
+
+## Code Details
+The steps for training and inference for the MLB dataset are given in [README_MLB](README_MLB.md).
+
