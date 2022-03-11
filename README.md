@@ -24,6 +24,9 @@ pip install -r requirements.txt
 ## Code Details
 The steps for training and inference for the MLB dataset are given in [README_MLB](README_MLB.md).
 
+## Model
+The links for the models are [MLB](https://huggingface.co/ratishsp/SeqPlan-MLB), [RotoWire](https://huggingface.co/ratishsp/SeqPlan-RotoWire) and [German RotoWire](https://huggingface.co/ratishsp/SeqPlan-GermanRotoWire).
+
 ## Model Outputs
 The model outputs are at [MLB](https://huggingface.co/datasets/GEM-submissions/ratishsp__seqplan__1646397329/raw/main/submission.json) and [German-RotoWire](https://huggingface.co/datasets/GEM-submissions/ratishsp__seqplan__1646397829/blob/main/submission.json).
 
