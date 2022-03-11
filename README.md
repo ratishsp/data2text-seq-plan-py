@@ -24,3 +24,9 @@ pip install -r requirements.txt
 ## Code Details
 The steps for training and inference for the MLB dataset are given in [README_MLB](README_MLB.md).
 
+## Model Outputs
+The model outputs are at [MLB](https://huggingface.co/datasets/GEM-submissions/ratishsp__seqplan__1646397329/raw/main/submission.json) and [German-RotoWire](https://huggingface.co/datasets/GEM-submissions/ratishsp__seqplan__1646397829/blob/main/submission.json).
+
+## Acknowledgements
+Part of the code is based on the [Sequential Knowledge Transformer repo](https://github.com/bckim92/sequential-knowledge-transformer).
+
