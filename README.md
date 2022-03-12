@@ -1,4 +1,4 @@
-# data2text-seq-plan-py
+# data2text-seq-plan-py [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/data-to-text-generation-with-variational/data-to-text-generation-on-mlb-dataset-2)](https://paperswithcode.com/sota/data-to-text-generation-on-mlb-dataset-2?p=data-to-text-generation-with-variational)
 This repo contains code for [Data-to-text Generation with Variational Sequential Planning](https://arxiv.org/abs/2202.13756) (Ratish Puduppully and Yao Fu and Mirella Lapata;  In Transactions of the Association for Computational Linguistics (TACL)); this code is based on an earlier (version 0.9.2) fork of [OpenNMT-py](https://github.com/OpenNMT/OpenNMT-py).
 
 ## Citation
