@@ -16,7 +16,8 @@ git checkout main
 
 1. Copy files related to inning detection from [here](https://drive.google.com/drive/folders/19u99YQqoG7K4xIq9XdeZgPGr2jvQSCIe) to ```${ORDINAL_ADJECTIVE_MAP_FOLDER}```
 
-2.  Process the data
+2.  Process the data.
+The script below downloads the MLB dataset from HF datasets repo. HF is not needed during training. So HF datasets can be installed in another conda environment (```pip install datasets```) and the script can be run in that environment.
 
 ```bash
 MLB=$SEQ_PLAN/mlb/
