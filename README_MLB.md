@@ -13,7 +13,10 @@ git checkout main
 ```
 
 ## __I.__ Training the model
-1. Process the data
+
+1. Copy files related to inning detection from [here](https://drive.google.com/drive/folders/19u99YQqoG7K4xIq9XdeZgPGr2jvQSCIe) to ```${ORDINAL_ADJECTIVE_MAP_FOLDER}```
+
+2.  Process the data
 
 ```bash
 MLB=$SEQ_PLAN/mlb/
@@ -27,7 +30,7 @@ ${ORDINAL_ADJECTIVE_MAP_FOLDER}/validtokens-ordinaladjective-inning-identifier
 python create_mlb_target_data.py -output_folder $MLB -dataset_type test -ordinal_adjective_map_file \
 ${ORDINAL_ADJECTIVE_MAP_FOLDER}/testtokens-ordinaladjective-inning-identifier
 ```
-2: Run bpe tokenization
+3. Run bpe tokenization
 ```
 MERGES=16000
 TRAIN_FILE_1=$MLB/train.pp
@@ -58,7 +61,7 @@ python apply_bpe.py -c $CODE --vocabulary-threshold 10 < $VALID_FILE_1 > $VALID_
 python apply_bpe.py -c $CODE --vocabulary-threshold 10 < $VALID_FILE_2 > $VALID_BPE_FILE_2
 ```
 
-3. Preprocess the dataset
+4. Preprocess the dataset
 ```
 PREPROCESS=$SEQ_PLAN/preprocess
 mkdir $PREPROCESS
@@ -78,7 +81,7 @@ python preprocess.py -train_src $MLB_TOKENIZED/train.bpe.pp \
                      -shard_size 1024\
                      -dynamic_dict
 ```
-4. Train model 
+5. Train model 
 ```
 MODELS=$SEQ_PLAN/models
 mkdir $MODELS
